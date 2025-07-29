@@ -1,0 +1,173 @@
+# yoga_alignment_app.py
+# Real-time Yoga Alignment Coach (CPU‑optimized) integrating 2100‑pose library
+
+import cv2
+import numpy as np
+import onnxruntime
+import json
+import threading
+from transformers import AutoFeatureExtractor, pipeline
+from TTS.api import TTS
+
+# ——— 1. LOAD POSES ———
+with open("yoga_poses.json", "r", encoding="utf-8") as f:
+    POSES = json.load(f)  # list of dicts with name, page, description, images
+
+# Helper: simple name-based lookup
+def find_pose_by_name(query: str):
+    q = query.lower()
+    for p in POSES:
+        if q in p["name"].lower():
+            return p
+    return None
+
+# ——— 2. MODEL INITIALIZATION (CPU) ———
+
+# 2.1 Pose detector (MoveNet ONNX on CPU)
+extractor = AutoFeatureExtractor.from_pretrained(
+    "xenova/movenet-singlepose-lightning"
+)
+pose_sess = onnxruntime.InferenceSession(
+    "movenet-singlepose-lightning.onnx",
+    providers=["CPUExecutionProvider"]
+)
+
+# 2.2 Speech-to-Text (Whisper‑small on CPU)
+stt = pipeline(
+    "automatic-speech-recognition",
+    model="openai/whisper-small",
+    device=-1    # force CPU
+)
+
+# 2.3 Text-to-Speech (VITS on CPU)
+tts = TTS(model_name="tts_models/en/vctk/vits")
+
+# Shared state for current pose selection
+current_pose = None
+
+# ——— 3. HELPER FUNCTIONS ———
+def detect_keypoints(frame: np.ndarray) -> np.ndarray:
+    """
+    Run MoveNet on a single RGB frame.
+    Returns: array of shape (1, 17, 3) – 17 keypoints with (y, x, confidence).
+    """
+    inputs = extractor(images=frame, return_tensors="np")
+    outputs = pose_sess.run(None, {k: v for k, v in inputs.items()})
+    return outputs[0]  # shape (1, 17, 3)
+
+def get_alignment_feedback(keypoints: np.ndarray) -> str:
+    """
+    Simple spine alignment check between shoulders and hips.
+    """
+    shoulders = keypoints[0, [5, 6], :]  # left & right shoulders
+    hips      = keypoints[0, [11, 12], :]  # left & right hips
+    avg_shoulder_y = float(shoulders[:, 0].mean())
+    avg_hip_y      = float(hips[:, 0].mean())
+    if abs(avg_shoulder_y - avg_hip_y) > 0.05:
+        return "Adjust: align hips under shoulders."
+    return "Good alignment!"
+
+# ——— 4. SPEECH COMMAND LOOP ———
+def listen_loop():
+    import sounddevice as sd
+    import soundfile as sf
+
+    global current_pose
+    while True:
+        print("[Listening for command…]")
+        rec = sd.rec(samplerate=16000, channels=1, dtype="float32", seconds=5)
+        sd.wait()
+        sf.write("cmd.wav", rec, 16000)
+        result = stt("cmd.wav")
+        text = result["text"]
+        print("You said:", text)
+
+        # Detect pose selection by name
+        pose = find_pose_by_name(text)
+        if pose:
+            current_pose = pose
+            reply = f"Starting {pose['name']} pose tracking."
+        else:
+            reply = "Sorry, pose not recognized. Try saying its name."
+
+        print("Replying:", reply)
+        tts.tts_to_file(text=reply, file_path="reply.wav")
+        data, rate = sf.read("reply.wav")
+        sd.play(data, rate)
+        sd.wait()
+
+# ——— 5. MAIN WEBCAM LOOP ———
+def main():
+    # start speech thread
+    threading.Thread(target=listen_loop, daemon=True).start()
+
+    cap = cv2.VideoCapture(0)
+    if not cap.isOpened():
+        print("❌ Cannot open webcam")
+        return
+
+    frame_count = 0
+    while True:
+        ret, frame_bgr = cap.read()
+        if not ret:
+            break
+
+        # Optional: skip every other frame if CPU is slow
+        # frame_count += 1
+        # if frame_count % 2 != 0:
+        #     continue
+
+        frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+        keypoints = detect_keypoints(frame_rgb)
+        feedback  = get_alignment_feedback(keypoints)
+
+        # draw keypoints
+        h, w = frame_bgr.shape[:2]
+        for y, x, c in keypoints[0]:
+            if c > 0.3:
+                cv2.circle(frame_bgr, (int(x * w), int(y * h)), 4, (0, 255, 0), -1)
+
+        # overlay current pose info
+        if current_pose:
+            # pose name
+            cv2.putText(
+                frame_bgr,
+                current_pose["name"],
+                (10, 30),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                1.0,
+                (0, 255, 0),
+                2,
+            )
+            # description snippet
+            desc = current_pose["description"][:60] + "..."
+            cv2.putText(
+                frame_bgr,
+                desc,
+                (10, 60),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.6,
+                (255, 255, 255),
+                1,
+            )
+
+        # overlay alignment feedback
+        cv2.putText(
+            frame_bgr,
+            feedback,
+            (10, h - 20),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.8,
+            (0, 255, 255),
+            2,
+        )
+
+        cv2.imshow("Yoga Alignment Coach", frame_bgr)
+        if cv2.waitKey(1) & 0xFF == ord("q"):
+            break
+
+    cap.release()
+    cv2.destroyAllWindows()
+
+if __name__ == "__main__":
+    main()
